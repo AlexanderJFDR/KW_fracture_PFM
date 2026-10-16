@@ -1,0 +1,380 @@
+//Newmark方法 + 当前Wuplus驱动 + 相场下界不可逆约束（无历史场）
+//以 main_half.edp 为基础，保留材料、线性软化、全刚度及质量同比退化。
+//初始驱动为0，PF-CZM起裂阈值由退化函数和裂纹几何函数决定。
+//在WSL2运行：mpirun -np 14 FreeFem++-mpi main_half_nohistory.edp -v 0
+load "PETSc"
+load "iovtk"
+load "gmsh"
+load "shell"
+include "macro_ddm.idp"
+macro dimension()2// EOM
+//材料参数 （质量、长度、时间单位量纲为g,mm,ms）
+real E = 19.0e4, nu = 0.3, sigma0=2812.25, Gc=22.2, SMALL=1e-8, rho=8.0e-3;
+real lamda=nu*E/(1.+nu)/(1.-2.*nu), G=E/2./(1.+nu);
+//裂纹几何参数
+//real ksi=0., c0=2., l0=0.2; //AT2相场
+//real ksi=1., c0=8/3, l0=0.2; //AT1相场
+real ksi=2.0, c0=pi, l0=0.25; //pf-CZM
+//退化函数参数
+real a1=2.0*ksi/c0*(E*Gc/sigma0^2)/l0, a2=-0.5, a3=0., p=2.0;
+//real a1=2., a2=-0.5, a3=0., p=2.;
+//比例阻尼
+real am = 0e-5, ak = 0e-5;
+//Newmark算法参数
+real deltat = 5.0e-5, delta = 1.0/4.0, gamma = 1.0/2.0;
+real b0 = 1.0/delta/deltat^2, b1 = gamma/delta/deltat, b2 = 1.0/delta/deltat, b3 = 1.0/2.0/delta-1.0, 
+     b4 = gamma/delta-1.0, b5 = deltat/2.0*(gamma/delta-2.0), b6 = deltat*(1.0-gamma), b7 = gamma*deltat;
+//交替求解参数
+real loadinit=0.0, loadrate = 16.54, damagethreshold=1e-2, maxIterations=1800, pressure=1.0;
+int maxAlternate=500;
+string outputDir="output_pfczm_wuplus_mass_nohistory";
+real damageError, tempError;
+//宏观模型参数
+real width = 1, length = 1, crackw = 0.5, crackl = 0.005, Slope = crackl/(2*crackw), m = 100, n = 50;
+real displacement, Force, strainEnergy, kineEnergy, crackEnergy, localForce, localStrainEnergy, localKineEnergy, localCrackEnergy;
+displacement=loadinit;
+//定义裂纹几何函数(一定要加括号！！！freefem直接把函数式进行拼接而不是调用函数)
+func real alpha(real d) {return ksi*d+(1-ksi)*d^2;} //
+func real dalpha(real d) {return ksi+2*(1-ksi)*d;} //
+func real ddalpha(real d) {return 2*(1-ksi);} //
+
+//定义函数
+macro fac1(d) ((1-d)^p) // 
+macro dfac1(d) (-p*(1-d)^(p-1)) // 
+macro ddfac1(d) (p*(p-1)*(1-d)^(p-2)) //
+
+//定义函数
+macro fac2(d) (fac1(d)+a1*d+a1*a2*d^2+a1*a2*a3*d^3) // 
+macro dfac2(d) (dfac1(d)+a1+2*a1*a2*d+3*a1*a2*a3*d^2) // 
+macro ddfac2(d) (ddfac1(d)+2*a1*a2+6*a1*a2*a3*d) // 
+
+//定义退化函数
+func real omega(real d) {return fac1(d)/fac2(d);} //
+func real domega(real d) {return (dfac1(d)*fac2(d)-fac1(d)*dfac2(d))/(fac2(d))^2;} //
+func real ddomega(real d) {return ((ddfac1(d)*fac2(d)-fac1(d)*ddfac2(d))*fac2(d)-2*(dfac1(d)*fac2(d)-fac1(d)*dfac2(d))*dfac2(d))/(fac2(d)^3);} //
+
+//定义刚度矩阵(平面应力)
+macro Q(E,nu)  [ [E/(1-nu^2),nu*E/(1-nu^2),0.],
+                [nu*E/(1-nu^2), E/(1-nu^2),0.],
+                [0.,0.,0.5*E/(1+nu)] ]//
+
+//定义应变
+macro epsilon(u,v) [dx(u),dy(v),dy(u)+dx(v)]//
+//主应变
+macro epsilon1(u,v) ((dx(u)+dy(v))/2+sqrt(((dx(u)-dy(v))/2)^2+((dx(v)+dy(u))/2)^2))//
+macro epsilon2(u,v) ((dx(u)+dy(v))/2-sqrt(((dx(u)-dy(v))/2)^2+((dx(v)+dy(u))/2)^2))//
+//主应力
+macro sigma1(u,v) ([E/(1-nu^2),nu*E/(1-nu^2),0.]'*[epsilon1(u,v),epsilon2(u,v),0.])//
+macro sigma2(u,v) ([nu*E/(1-nu^2), E/(1-nu^2),0.]'*[epsilon1(u,v),epsilon2(u,v),0.])//
+
+//定义取正函数
+func real isplus(real a)
+{
+    real num = 0;
+    if(a>0)
+    {
+        num = a;
+    }
+    return num;
+}
+
+//定义能量分解
+//无分解
+macro energy(u,v) (0.5*epsilon(u,v)'*Q(E,nu)*epsilon(u,v)) //
+//球量偏量分解
+macro VDplus(u,v) (0.5*(lamda+2*G/3)*isplus((dx(u)+dy(v)))^2+G*((dx(u)-dy(v))^2/2+(dy(u)+dx(v))^2/2)) //
+//谱分解
+macro Mieheplus(u,v) (0.5*lamda*(isplus(epsilon1(u,v)+epsilon2(u,v)))^2+G*((isplus(epsilon1(u,v)))^2+(isplus(epsilon2(u,v)))^2)) // 
+//最大主应力分解
+macro Wuplus(u,v) (0.5*isplus(sigma1(u,v))^2/E)//
+
+//建立宏观有限元模型
+mesh Th=gmshload("mesh/shear_fixed_70deg.msh");
+buildDmesh(Th);
+
+//定义有限元空间
+func singleP = P1; 
+func doubleP = [P1, P1];
+fespace Vh(Th,doubleP), Eh(Th,singleP), Ph(Th,singleP), Hh(Th,P0); //损伤d用P1元就行，用P2元就不行？
+Vh [u,v],[u1,v1],[vv1,vv2],[aa1,aa2],[tempu,tempv],[tempvv1,tempvv2],[tempaa1,tempaa2];
+Eh d, d1, deltad, dd, tempd, damage, damageLower, damageUpper, uu, vv, outv1, outv2, epsilonx, epsilony, gammaxy, xx=x, yy=y, dxd, dyd, dtd;
+Ph ALPHA, DALPHA, DDALPHA, OMEGA, DOMEGA, DDOMEGA;
+//P0当前拉伸驱动力；每次交替迭代按当前位移重新计算，不累计最大值。
+Hh WuCurrent;
+
+//自由度数
+int DofP1 = u[].n;
+int DofP0 = d[].n;
+//先初始化退化系数，再组装未损伤的初始质量/刚度。
+d=0; damage=0; tempd=0; OMEGA=omega(d); WuCurrent=0;
+
+//定义变分
+varf Mass([u,v],[u1,v1]) = int2d(Th)((OMEGA+1e-8)*rho*[u,v]'*[u1,v1])+on(1,v=0)+on(2,u=0);
+varf Stiff([u,v],[u1,v1]) = int2d(Th)((OMEGA+1e-8)*epsilon(u,v)'*Q(E,nu)*epsilon(u1,v1))+on(1,v=0)+on(2,u=0);
+varf Damp([u,v],[u1,v1]) = int2d(Th)(am*(OMEGA+1e-8)*rho*[u,v]'*[u1,v1]) + int2d(Th)(ak*(OMEGA+1e-8)*epsilon(u,v)'*Q(E,nu)*epsilon(u1,v1))+on(1,v=0)+on(2,u=0);
+varf StiffEQ([u,v],[u1,v1]) = int2d(Th)((b0+b1*am)*(OMEGA+1e-8)*rho*[u,v]'*[u1,v1]) + int2d(Th)((1+b1*ak)*(OMEGA+1e-8)*epsilon(u,v)'*Q(E,nu)*epsilon(u1,v1))+on(1,v=0)+on(2,u=0);
+varf Basis([u,v],[u1,v1]) = on(1,v=0)+on(2,u=0);
+
+varf Tensile([u,v],[u1,v1]) = on(1,v=0)+on(2,u=displacement);
+varf initTensile([u,v],[u1,v1]) = on(1,v=0)+on(2,u=0);
+
+varf PhaseJacobian(d,d1) = int2d(Th)((DDOMEGA*WuCurrent+DDALPHA*Gc/c0/l0)*d*d1+2*Gc*l0/c0*(dx(d)*dx(d1)+dy(d)*dy(d1)));
+varf PhaseResidual(dummy,d1) = int2d(Th)((DOMEGA*WuCurrent+DALPHA*Gc/c0/l0)*d1+2*l0/c0*Gc*(dx(d)*dx(d1)+dy(d)*dy(d1)));
+//varf PhaseBound0(d,d1) = -int2d(Th)((-2*(1-damage)*WuCurrent+2*damage*Gc/c0/l0)*d1+2*l0/c0*Gc*(dx(damage)*dx(d1)+dy(damage)*dy(d1)));
+//varf PhaseField(d,d1) = int2d(Th)((2*WuCurrent+Gc/l0)*d*d1+Gc*l0*(dx(d)*dx(d1)+dy(d)*dy(d1)));
+//varf PhaseBound(d,d1) = int2d(Th)(2*WuCurrent*d1);
+
+//位移场初始化
+[vv1,vv2]=[0,0]; [tempvv1,tempvv2]=[0,0];
+Mat Muu, Kuu, Cuu, Keq, Kba;
+{
+	macro def(i)[i, i#B]//
+	macro init(i)[i, i]//
+	createMat(Th, Muu, doubleP); createMat(Th, Kuu, doubleP); createMat(Th, Cuu, doubleP); createMat(Th, Keq, doubleP); createMat(Th, Kba, doubleP);
+}
+set(Muu, sparams="-pc_type hypre"); set(Kuu, sparams="-pc_type hypre"); set(Cuu, sparams="-pc_type hypre"); set(Keq, sparams="-pc_type hypre"); set(Kba, sparams="-pc_type hypre");
+Muu = Mass(Vh,Vh); Kuu = Stiff(Vh,Vh);
+
+real[int] bu = Tensile(0,Vh);
+real[int] bu0 = initTensile(0,Vh);
+u[] = Kuu^-1*bu0; [tempu,tempv]=[u,v];
+real[int] vec0(DofP1);
+real[int] tempvec = Kuu*u[];
+for(int j=0; j<DofP1; j++)
+{
+    vec0(j) = bu[j]-tempvec(j);
+}
+aa1[] = Muu^-1*vec0;
+[tempaa1,tempaa2]=[aa1,aa2];
+
+//相场初始化
+Mat Kpp;
+{
+	macro def(i) i //
+	macro init(i) i //
+	createMat(Th, Kpp, P1);
+}	
+set(Kpp, sparams="-pc_type hypre");
+
+//PETSc reduced-space active-set Newton method for dLower <= d <= 1
+func real[int] PhaseResidualPETSc(real[int]& inPETSc)
+{
+	ChangeNumbering(Kpp, d[], inPETSc, inverse=true, exchange=true);
+	DALPHA = dalpha(d);
+	DOMEGA = domega(d);
+	real[int] localResidual = PhaseResidual(0,Eh);
+	real[int] outPETSc;
+	ChangeNumbering(Kpp, localResidual, outPETSc);
+	return outPETSc;
+}
+
+func int PhaseJacobianPETSc(real[int]& inPETSc)
+{
+	ChangeNumbering(Kpp, d[], inPETSc, inverse=true, exchange=true);
+	DDALPHA = ddalpha(d);
+	DDOMEGA = ddomega(d);
+	Kpp = PhaseJacobian(Eh,Eh);
+	return 0;
+}
+
+//相场和当前驱动已在初始矩阵组装前置零；不引入Hc历史底座。
+
+//保存数据：仅根进程创建独立结果目录，然后MPI同步。
+if(mpirank==0)
+{
+    if(isdir(outputDir)<0) assert(mkdir(outputDir)==0);
+    if(isdir(outputDir+"/paraview")<0) assert(mkdir(outputDir+"/paraview")==0);
+    if(isdir(outputDir+"/direct")<0) assert(mkdir(outputDir+"/direct")==0);
+}
+mpiBarrier(mpiCommWorld);
+ofstream Fx(mpirank==0 ? outputDir+"/time-force.txt" : "/dev/null");
+if(mpirank==0)
+{
+    Fx<<"time force strain_energy kine_energy crack_energy"<<endl;
+}
+//paraview
+int[int] vtuOrder=[1,1,1,1,1,1,1,1,0];
+uu=0; vv=0; outv1=0; outv2=0; epsilonx=0; epsilony=0; gammaxy=0;
+savevtk(outputDir+"/paraview/damage0.vtu", Th, uu, vv, outv1, outv2, epsilonx, epsilony, gammaxy, damage, WuCurrent, 
+        dataname="u1 u2 v1 v2 exx eyy exy d Wuplus_current", order=vtuOrder);
+//direct
+dxd=0; dyd=0; dtd=0;
+ofstream Fy(outputDir+"/direct/damage0_"+mpisize+"_"+mpirank+".txt");
+for(int i=0; i<DofP0; i++)
+{
+	Fy<<xx[](i)<<" "<<yy[](i)<<" "<<damage[](i)<<" "<<dxd[](i)<<" "<<dyd[](i)<<" "<<dtd[](i)<<endl;
+}
+
+//等待所有进程完成
+mpiBarrier(mpiCommWorld);
+
+//时间步求解
+int index = 0;
+while (index<maxIterations)
+{
+    damageError = 1;
+	damageLower = damage;
+	damageUpper = 1.0;
+	real currentTime = (index+1)*deltat;
+	if(currentTime <= 1.0e-3) // 1 μs
+	{
+		displacement = 0.5*(loadrate/1.0e-3)*currentTime^2;
+	}
+	else
+	{
+		displacement = loadrate*(currentTime-0.5e-3);
+	}
+    int iter=0;
+    while (damageError > damagethreshold)
+    {
+		//重划分并行域
+		{
+			macro def(i)[i, i#B]//
+			macro init(i)[i, i]//
+			Mat Muu1, Kuu1, Cuu1, Keq1, Kba1;
+			createMat(Th, Muu1, doubleP); createMat(Th, Kuu1, doubleP); createMat(Th, Cuu1, doubleP); createMat(Th, Keq1, doubleP); createMat(Th, Kba1, doubleP);
+			Muu = Muu1; Kuu = Kuu1; Cuu = Cuu1; Keq = Keq1; Kba = Kba1; 
+		}
+		{
+			Mat Kpp1;
+			createMat(Th, Kpp1, P1);
+			Kpp = Kpp1;
+		}
+		//求解位移场
+        OMEGA = omega(damage);
+        Muu = Mass(Vh,Vh);
+        Kuu = Stiff(Vh,Vh);
+        Cuu = Damp(Vh,Vh);
+        Keq = StiffEQ(Vh,Vh);
+		Kba = Basis(Vh,Vh);
+
+        real[int] bu = Tensile(0,Vh);
+        real[int] beq(DofP1);
+        //equivalent load
+        real[int] vec1(DofP1), vec2(DofP1);
+        for(int j = 0; j < DofP1; j++)
+        {
+            vec1(j) = b0*tempu[](j)+b2*tempvv1[](j)+b3*tempaa1[](j);
+            vec2(j) = b1*tempu[](j)+b4*tempvv1[](j)+b5*tempaa1[](j);
+        }
+        real[int] vec3 = Muu*vec1, vec4 = Cuu*vec2, vec5 = Kba*vec1, vec6 = Kba*vec2;
+        for(int i = 0; i < DofP1; i++)
+        {
+            beq(i) = bu(i) + (vec3(i)-vec5(i)) + (vec4(i)-vec6(i));
+        }
+        u[] = Keq^-1*beq;
+
+        //计算相场求解所需参数
+        ALPHA = alpha(damage);
+        DALPHA = dalpha(damage);
+        DDALPHA = ddalpha(damage);
+        DOMEGA = domega(damage);
+        DDOMEGA = ddomega(damage);
+        //仅使用当前位移的Wuplus；时间步下界damageLower负责不可逆性。
+        WuCurrent = Wuplus(u,v);
+
+		//进程同步
+		mpiBarrier(mpiCommWorld);
+		
+		//求解带约束相场：时间步下界damageLower，上界1
+		DALPHA = dalpha(d);
+		DOMEGA = domega(d);
+		DDALPHA = ddalpha(d);
+		DDOMEGA = ddomega(d);
+		Kpp = PhaseJacobian(Eh,Eh);
+		real[int] xPETSc, zeroPETSc, lowerPETSc, upperPETSc;
+		ChangeNumbering(Kpp, d[], xPETSc);
+		ChangeNumbering(Kpp, damageLower[], lowerPETSc);
+		ChangeNumbering(Kpp, damageUpper[], upperPETSc);
+		zeroPETSc.resize(xPETSc.n);
+		zeroPETSc = 0.0;
+		int snesReason;
+		SNESSolve(Kpp, PhaseJacobianPETSc, PhaseResidualPETSc, zeroPETSc, xPETSc, xl=lowerPETSc, xu=upperPETSc,
+			sparams="-snes_type vinewtonrsls -snes_rtol 1e-5 -snes_atol 1e-6 -snes_max_it 80 -snes_converged_reason -ksp_type gmres -ksp_rtol 1e-7 -pc_type hypre", reason=snesReason);
+		if(snesReason < 0)
+		{
+			if(mpirank == 0)
+				cout << "SNES failed at step = " << index+1 << ", alternate iteration = " << iter << ", reason = " << snesReason << endl;
+			exit(1);
+		}
+		ChangeNumbering(Kpp, d[], xPETSc, inverse=true, exchange=true);
+		dd = d-damage;		
+		damage = d;
+
+		damageError = 0;
+		tempError = 0;
+		for(int i = 0; i < DofP0; i++)
+		{
+			tempError = max(tempError,abs(dd[](i)));
+		}
+		mpiAllReduce(tempError, damageError, mpiCommWorld, mpiMAX);
+		mpiBarrier(mpiCommWorld);
+		if(mpirank==0)
+		{
+			cout<<"iter = "<<iter<<endl;
+			cout<<"damageError = "<<damageError<<endl;
+		}
+		if(iter+1>=maxAlternate && damageError>damagethreshold)
+		{
+			if(mpirank==0) cout << "Alternate solve failed at step=" << index+1 << ", error=" << damageError << endl;
+			exit(1);
+		}
+        //迭代记录
+        iter = iter+1;
+    }
+    //更新速度与加速度
+    for(int i = 0; i < DofP1; i++)
+    {
+        aa1[](i) = b0*(u[](i)-tempu[](i)) - b2*tempvv1[](i) - b3*tempaa1[](i);
+        vv1[](i) = tempvv1[](i) + b6*tempaa1[](i) + b7*aa1[](i);
+    }
+	//更新位移场
+    [tempu,tempv] = [u,v]; [tempvv1,tempvv2] = [vv1,vv2]; [tempaa1,tempaa2] = [aa1,aa2];
+    //更新相场
+    dtd = (d-tempd)/deltat; tempd = d; damage = d;
+    //更新序号
+    index = index+1;
+    //输出力、能量
+	OMEGA = omega(d);
+	ALPHA = alpha(d);
+    //MPI重叠区只乘一次P1分片单位；能量梯度使用原始d，不使用加权d的梯度。
+    Eh scaledOne=1.0;
+    for[i, r:Kpp.D] scaledOne[][i] *= r;
+    localForce=-int1d(Th,2)(scaledOne*(OMEGA+SMALL)*([E/(1-nu^2),nu*E/(1-nu^2),0.]'*epsilon(u,v)));
+    localStrainEnergy=0.5*int2d(Th,qforder=4)(scaledOne*(OMEGA+SMALL)*epsilon(u,v)'*Q(E,nu)*epsilon(u,v));
+    localKineEnergy=0.5*int2d(Th,qforder=4)(scaledOne*(OMEGA+SMALL)*rho*[vv1,vv2]'*[vv1,vv2]);
+    localCrackEnergy=Gc/c0*int2d(Th,qforder=4)(scaledOne*(alpha(d)/l0+l0*(dx(d)^2+dy(d)^2)));
+    mpiAllReduce(localForce, Force, mpiCommWorld, mpiSUM);
+    mpiAllReduce(localStrainEnergy, strainEnergy, mpiCommWorld, mpiSUM);
+    mpiAllReduce(localKineEnergy, kineEnergy, mpiCommWorld, mpiSUM);
+    mpiAllReduce(localCrackEnergy, crackEnergy, mpiCommWorld, mpiSUM);
+    if(mpirank==0)
+	{
+        Fx<<index*deltat<<"  "<<Force<<" "<<strainEnergy<<" "<<kineEnergy<<" "<<crackEnergy<<endl;
+		Fx.flush;
+    }
+    //输出paraview
+    if(index%5==0)
+    {
+        uu=u; vv=v; outv1=vv1; outv2=vv2; epsilonx=dx(u); epsilony=dy(v); gammaxy=dx(v)+dy(u);
+        savevtk(outputDir+"/paraview/damage"+index+".vtu", Th, uu, vv, outv1, outv2, epsilonx, epsilony, gammaxy, damage, WuCurrent, 
+                dataname="u1 u2 v1 v2 exx eyy exy d Wuplus_current", order=vtuOrder);
+    }
+    //输出direct
+    if(index%2==0)
+    {
+        ofstream Fy(outputDir+"/direct/damage"+index/2+"_"+mpisize+"_"+mpirank+".txt");
+        dxd=dx(d); dyd=dy(d);
+        for(int i=0; i<DofP0; i++)
+        {
+            Fy<<xx[](i)<<" "<<yy[](i)<<" "<<damage[](i)<<" "<<dxd[](i)<<" "<<dyd[](i)<<" "<<dtd[](i)<<endl;
+        }
+    }
+    //打印进行的迭代步
+	if(mpirank==0)
+	{
+		cout<<"step = "<<index<<endl;
+	}
+	//进程同步
+	mpiBarrier(mpiCommWorld);
+}
