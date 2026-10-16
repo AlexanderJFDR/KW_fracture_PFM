@@ -248,16 +248,11 @@ Postprocessing parallel results requires removing MPI overlap; the contributions
 
 ### Phase Field and Crack Propagation
 
-<video src="figure/d.mp4" controls preload="metadata" width="800">
-  <a href="figure/d.mp4">Play / download the phase-field evolution video</a>
-</video>
+![Phase-field evolution](figure/d.gif)
 
 ### Velocity Magnitude and Motion Response under Stress Waves
 
-<video src="figure/v.mp4" controls preload="metadata" width="800">
-  <a href="figure/v.mp4">Play / download the velocity-magnitude evolution video</a>
-</video>
-
+![Velocity magnitude evolution](figure/v.gif)
 ## References
 
 1. Borden, M. J., Verhoosel, C. V., Scott, M. A., Hughes, T. J. R., & Landis, C. M. (2012). *A phase-field description of dynamic brittle fracture*. Computer Methods in Applied Mechanics and Engineering, 217–220, 77–95. [DOI](https://doi.org/10.1016/j.cma.2012.01.008). See §4.3 for the dynamic shear benchmark and Remark 4.5 for the discussion of fracture energy overestimation.
